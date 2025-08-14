@@ -1,0 +1,137 @@
+name: Deploy Lambda function
+
+on:
+  workflow_call:
+    inputs:
+      region_slug:
+        required: true
+        type: string
+      lambda_names:
+        required: true
+        type: string
+      s3_ref:
+        default: "master"
+        type: string
+      layer_enabled:
+        default: false
+        type: boolean
+      layer_name:
+        default: ''
+        type: string
+      debug:
+        default: false
+        type: boolean
+
+jobs:
+  validate-inputs:
+    runs-on: [self-hosted, linux, aws]
+    steps:
+      - name: Inputs validation
+        run: |
+          if ${{ inputs.layer_enabled }} && [[ "${{ inputs.layer_name }}" == '' ]]; then
+            echo "layer_name is required, or layer_enabled must be false"
+            exit 1
+          fi
+  prepare:
+    needs: validate-inputs
+    runs-on: [self-hosted, linux, aws]
+    outputs:
+      s3_bucket_name: ${{ steps.region_s3_bucket_name.outputs.s3_bucket_name }}
+      s3_ref: ${{ steps.region_s3_bucket_name.outputs.s3_ref }}
+      region: ${{ steps.region_s3_bucket_name.outputs.region }}
+      layer_version_arn: ${{ steps.get_lambda_layer.outputs.layer_version_arn }}
+    steps:
+      - name: Prepare region & S3 bucket name
+        id: region_s3_bucket_name
+        env:
+          s3_bucket_name: paradox-app-deploy
+        run: |
+          if [[ "${{ inputs.region_slug }}" == 'use1' ]]; then
+            echo s3_bucket_name=${{ env.s3_bucket_name }} >> $GITHUB_OUTPUT
+          else
+            echo s3_bucket_name=${{ env.s3_bucket_name }}-${{ inputs.region_slug }} >> $GITHUB_OUTPUT
+          fi
+          
+          case "${{ inputs.region_slug }}" in
+            use1) region="us-east-1" ;;
+            usw2) region="us-west-2" ;;
+            euw1) region="eu-west-1" ;;
+            euc1) region="eu-central-1" ;;
+            *) echo "Not supported region" >&2; exit 1 ;;
+          esac
+          echo region=$region >> $GITHUB_OUTPUT
+
+          #if [[ "${{ inputs.environment }}" == "dev" ]]; then
+          #  echo s3_ref="rc" >> $GITHUB_OUTPUT
+          #else
+          #  echo s3_ref="${{ inputs.s3_ref }}" >> $GITHUB_OUTPUT
+          #fi
+          echo s3_ref="${{ inputs.s3_ref }}" >> $GITHUB_OUTPUT
+
+      - name: Publish new layer and get layer version arn
+        if: inputs.layer_enabled == true
+        id: get_lambda_layer
+        run: |
+          command=(aws lambda publish-layer-version \
+            --layer-name ocs-${{ inputs.environment }}-managed-layer \
+            --region ${{ steps.region_s3_bucket_name.outputs.region }} \
+            --description "Published by Github Action" \
+            --content S3Bucket=${{ steps.region_s3_bucket_name.outputs.s3_bucket_name }},S3Key=lambda/${GITHUB_REPOSITORY#*/}/${{ steps.region_s3_bucket_name.outputs.s3_ref }}/layer-deployment.zip \
+            --query 'LayerVersionArn' --output text)
+          if ${{ inputs.debug }}; then
+            echo "${command[@]}"
+          else
+            layer_version_arn=$("${command[@]}")
+            echo layer_version_arn=$layer_version_arn >> $GITHUB_OUTPUT
+          fi
+  update_function_code:
+    name: Update ${{ matrix.lambda_name }}
+    needs: prepare
+    runs-on: [self-hosted, linux, aws]
+    strategy:
+      fail-fast: true
+      matrix:
+        lambda_name: ${{ fromJSON(inputs.lambda_names) }}
+    env:
+      s3_bucket_name: ${{ needs.prepare.outputs.s3_bucket_name }}
+      s3_ref: ${{ needs.prepare.outputs.s3_ref }}
+      region: ${{ needs.prepare.outputs.region }}
+      layer_version_arn: ${{ needs.prepare.outputs.layer_version_arn }}
+      debug: ${{ inputs.debug }}
+    steps:
+      - name: Update Lambda function source
+        run: |
+          command=(aws lambda update-function-code \
+            --function-name ${{ matrix.lambda_name }} \
+            --region ${{ env.region }} \
+            --s3-bucket ${{ env.s3_bucket_name }} \
+            --s3-key lambda/${GITHUB_REPOSITORY#*/}/${{ env.s3_ref }}/deployment.zip)
+          if $debug; then
+            echo "${command[@]}"
+          else
+            "${command[@]}"
+          fi
+
+      - name: Wait until Lambda update is complete
+        run: |
+          command=(aws lambda wait function-updated-v2 \
+            --function-name ${{ matrix.lambda_name }} \
+            --region ${{ env.region }})
+          if $debug; then
+            echo "${command[@]}"
+          else
+             "${command[@]}"
+          fi
+
+      - name: Update Lambda function layer
+        if: inputs.layer_enabled == true
+        run: |
+          command=(aws lambda update-function-configuration \
+            --function-name ${{ matrix.lambda_name }} \
+            --region ${{ env.region }} \
+            --layers ${{ env.layer_version_arn }})
+          if $debug; then
+            echo "${command[@]}"
+          else
+             "${command[@]}"
+          fi
